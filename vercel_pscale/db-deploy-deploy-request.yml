@@ -1,0 +1,88 @@
+name: Deploy a deploy request
+env: 
+  PSCALE_ORG: # @TODO Your planetscale ORG
+  PSCALE_DB: # @TODO Pscale DB
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: 
+      # @TODO Path to your schema
+      - 'packages/schema/src/**'
+    types: [closed]
+
+jobs:
+  deploy_deploy_request:
+
+    # This only runs when a PR is merged
+    if: (github.actor != 'dependabot[bot]') && (contains(github.head_ref, 'dependabot/') == false) && (github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pscale
+        uses: planetscale/setup-pscale-action@v1
+
+      - name: Get DB branch
+        id: get_branch_name
+        run: |
+          # Deploy requests require a target branch. Set this in your PR body
+          # by including `db:[branch name]`
+          #
+          #---- Example PR Body
+          #
+          # This adds XYZ tables that do ABC.
+          # db:dev-abc
+          #
+          #---- End Example
+          if [[ "${{github.event.pull_request.body}}" =~ db:([[:alnum:]-]+) ]]
+          then
+            branch="${BASH_REMATCH[1]}"
+            echo "branch=$branch" >> $GITHUB_OUTPUT
+          else
+            # If you forget to set a branch, this will error.
+            echo "Cant find target DB branch, did you forget to set it?"
+            exit 1
+          fi
+
+      - name: Use pscale
+        id: deploy_deploy_request
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # This lists all deploy requests and grabs the open request from the selected branch. 
+          deploy_number=$(pscale deploy-request --org $PSCALE_ORG -f json ls $PSCALE_DB | jq -e '[.[] | select(.branch == "${{steps.get_branch_name.outputs.branch}}" and .state == "open")] | .[0].number')
+          echo "deploy_number=$deploy_number" >> $GITHUB_OUTPUT
+
+      - name: Deploy a deploy request
+        if: steps.deploy_deploy_request.outputs.deploy_number
+        uses: planetscale/deploy-deploy-request-action@v4
+        with:
+          # We wait for the deploy request to finish, this important for the next step
+          wait: true
+          org_name: $PSCALE_ORG
+          database_name: $PSCALE_DB
+          number: ${{steps.deploy_deploy_request.outputs.deploy_number}}
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+
+      - name: Create new backup with new schema
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # We backup the production branch so that the next branch that uses seed data will 100% be up to daate with prod's new schema
+          pscale backup --org $PSCALE_ORG create $PSCALE_DB main
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "**Deployed Deploy Request** ✅\n [Deploy Request #${{steps.get_branch_name.outputs.branch}}](https://app.planetscale.com/${{env.PSCALE_ORG}}/${{env.PSCALE_DB}}/deploy-requests/${{steps.deploy_deploy_request.outputs.number}})"
+            })

@@ -1,0 +1,76 @@
+name: Create Deploy Request
+env: 
+  PSCALE_ORG: # @TODO Your planetscale ORG
+  PSCALE_DB: # @TODO Pscale DB
+on:
+  pull_request:
+    paths: 
+      # @TODO Path to your schema
+      - 'packages/schema/src/**'
+    types: [opened, reopened]
+
+jobs:
+  create_deploy_request:
+    runs-on: ubuntu-latest
+    if: (github.actor != 'dependabot[bot]') && (contains(github.head_ref, 'dependabot/') == false)
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pscale
+        uses: planetscale/setup-pscale-action@v1
+
+      - name: Get DB branch
+        id: get_branch_name
+        shell: bash
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # Deploy requests require a target branch. Set this in your PR body
+          # by including `db:[branch name]`
+          #
+          #---- Example PR Body
+          #
+          # This adds XYZ tables that do ABC.
+          # db:dev-abc
+          #
+          #---- End Example
+          if [[ "${{github.event.pull_request.body}}" =~ db:([[:alnum:]-]+) ]]
+          then
+            branch="${BASH_REMATCH[1]}"
+            echo "branch=$branch" >> $GITHUB_OUTPUT
+          else
+            echo "Cant find target DB branch, did you forget to set it?"
+            exit 1
+          fi
+
+      - name: Check branch exists
+        shell: bash
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # Ensure the branch actually exists on pscale
+          pscale branch --org $PSCALE_ORG list $PSCALE_DB -f json | jq -e '[.[].name | select(. != "main")] | any(. == "${{steps.get_branch_name.outputs.branch}}")'
+
+      - name: Create Deploy Request
+        id: create_deploy_request
+        shell: bash
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # Create the deploy request and grab its ID
+          number=$(pscale deploy-request --org $PSCALE_ORG create $PSCALE_DB ${{steps.get_branch_name.outputs.branch}} -f json | jq -e '.number')
+          echo "number=$number" >> $GITHUB_OUTPUT
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "**Created Deploy Request** ✅\n [Deploy Request #${{steps.get_branch_name.outputs.branch}}](https://app.planetscale.com/${{env.PSCALE_ORG}}/${{env.PSCALE_DB}}/deploy-requests/${{steps.create_deploy_request.outputs.number}})"
+            })

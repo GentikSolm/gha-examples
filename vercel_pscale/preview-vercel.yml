@@ -1,0 +1,133 @@
+name: Preview
+env:
+  PSCALE_ORG: # @TODO Your planetscale ORG
+  PSCALE_DB: # @TODO Pscale DB
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.PROJECT_ID }}
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+on:
+  pull_request:
+    paths: 
+      # @TODO Dependant paths for the subproject, or none if single-project
+
+    # Only run preview when a PR is opened, re-opened, or a review is requested.
+    # You may or may not want a different flow. we found that triggering on every
+    # push was too much
+    types: [opened, reopened, review_requested]
+jobs:
+  preview:
+    if: (github.actor != 'dependabot[bot]') && (contains(github.head_ref, 'dependabot/') == false)
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v2.4.0
+        with:
+          version: 8.12.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: pnpm
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        name: Setup pnpm cache
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install Vercel CLI
+        run: pnpm install --global vercel@latest
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Pull Vercel Environment Information
+        run: |
+          # @TODO DONT SET YOUR DB KEYS IN VERCEL FOR PREVIEWS IF USING THIS FLOW
+          # We overwrite the db keys with ones we generate in this action.
+          # This moves the vercel .env file for convenience 
+          vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
+          mv ./.vercel/.env* .env 
+
+      - name: Setup pscale
+        uses: planetscale/setup-pscale-action@v1
+
+      - name: Setup DB keys
+        id: db_keys
+        shell: bash
+        env:
+          PLANETSCALE_SERVICE_TOKEN_ID: ${{ secrets.PLANETSCALE_SERVICE_TOKEN_ID }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+        run: |
+          # If this PR has schema changes, set the pscale branch in your PR body
+          # by including `db:[branch name]`. If there are NO schema changes, dont include any branch,
+          # and `stage` will be used by default.
+          #
+          #---- Example PR Body
+          #
+          # This adds XYZ tables that do ABC.
+          # db:dev-abc
+          #
+          #---- End Example
+          if [[ "${{github.event.pull_request.body}}" =~ db:([[:alnum:]-]+) ]]
+          then
+            branch="${BASH_REMATCH[1]}"
+            echo "branch=$branch" >> $GITHUB_OUTPUT
+          else
+            echo 'branch="stage"' >> $GITHUB_OUTPUT
+
+            # We make sure that stage is up to date schema-wise with prod.
+            # If not, we re-create stage with a new backup of prod.
+            # We can be sure the schema is up to date thanks to `db-deploy-deploy-request.yml` creating
+            # a fresh backup when a deploy request is merged
+            diff=$(pscale branch --org $PSCALE_ORG diff $PSCALE_DB stage)
+            if [[ $diff -ne "" ]]
+            then
+              pscale branch --org $PSCALE_ORG delete $PSCALE_DB stage
+              pscale branch --org $PSCALE_ORG create $PSCALE_DB stage --wait --seed-data
+            fi
+          fi
+
+          # New username, password, and host urls
+          clump=$(pscale password --org $PSCALE_ORG create $PSCALE_DB $branch ${{github.run_id}} --role readwriter -f json | jq -r '.username + " " + .plain_text + " " + .access_host_url')
+          read -r username password host < <(echo $clump)
+          echo "username=$username" >> $GITHUB_OUTPUT
+          echo "password=$password" >> $GITHUB_OUTPUT
+          echo "host=$host" >> $GITHUB_OUTPUT
+
+          # Add them to .env for `vercel build`
+          echo "DATABASE_USERNAME=$username" >> .env
+          echo "DATABASE_PASSWORD=$password" >> .env
+          echo "DATABASE_HOST=$host" >> .env
+
+      - name: Build Project Artifacts
+        run: vercel build --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy Project Artifacts to Vercel
+        id: deploy
+        run: |
+          # We need to re-set the env variables for the db when deploying through the CLI
+          echo "preview_url=$(vercel deploy --prebuilt --token=${{secrets.VERCEL_TOKEN}} -e DATABASE_HOST=${{steps.db_keys.outputs.host}} -e DATABASE_PASSWORD=${{steps.db_keys.outputs.password}} -e DATABASE_USERNAME=${{steps.db_keys.outputs.username}})" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR
+        # Adds preview link
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "**Preview Deployment** ✅\n [Visit Preview](${{steps.deploy.outputs.preview_url}})"
+            })
