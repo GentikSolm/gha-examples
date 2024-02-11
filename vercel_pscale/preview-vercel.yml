@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v2.4.0
+      - uses: pnpm/action-setup@v3.0.0
         with:
           version: 8.12.1
           run_install: false
@@ -83,24 +83,23 @@ jobs:
           if [[ "${{github.event.pull_request.body}}" =~ db:([[:alnum:]-]+) ]]
           then
             branch="${BASH_REMATCH[1]}"
-            echo "branch=$branch" >> $GITHUB_OUTPUT
           else
-            echo 'branch="stage"' >> $GITHUB_OUTPUT
-
             # We make sure that stage is up to date schema-wise with prod.
             # If not, we re-create stage with a new backup of prod.
             # We can be sure the schema is up to date thanks to `db-deploy-deploy-request.yml` creating
             # a fresh backup when a deploy request is merged
-            diff=$(pscale branch --org $PSCALE_ORG diff $PSCALE_DB stage)
+            branch="stage"
+            diff=$(pscale branch --org $PSCALE_ORG diff papertrail stage)
             if [[ $diff -ne "" ]]
             then
-              pscale branch --org $PSCALE_ORG delete $PSCALE_DB stage
+              pscale branch --org $PSCALE_ORG delete $PSCALE_DB  stage
               pscale branch --org $PSCALE_ORG create $PSCALE_DB stage --wait --seed-data
             fi
           fi
 
+          echo "branch=$branch" >> $GITHUB_OUTPUT
           # New username, password, and host urls
-          clump=$(pscale password --org $PSCALE_ORG create $PSCALE_DB $branch ${{github.run_id}} --role readwriter -f json | jq -r '.username + " " + .plain_text + " " + .access_host_url')
+          clump=$(pscale password --org $PSCALE_ORG create $PSCALE_DB $branch gha-${{github.run_id}} --role readwriter -f json | jq -r '.username + " " + .plain_text + " " + .access_host_url')
           read -r username password host < <(echo $clump)
           echo "username=$username" >> $GITHUB_OUTPUT
           echo "password=$password" >> $GITHUB_OUTPUT
